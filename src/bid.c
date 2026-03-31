@@ -3,16 +3,79 @@
 #include <stdio.h>
 #include <time.h>
 #include <sys/select.h>
+#include <string.h>
 
 #include "../include/common.h"
 #include "../include/lock.h"
 #include "../include/bid.h"
 
-// 🔥 Get base price of property
+#define LOG_FILE "data/txn.log"
+
+// 🔥 Write log
+void write_log(char *msg) {
+    int fd = open(LOG_FILE, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    write(fd, msg, strlen(msg));
+    close(fd);
+}
+
+// 🔥 BEGIN
+void begin_txn(int property_id) {
+    char buf[100];
+    sprintf(buf, "BEGIN %d\n", property_id);
+    write_log(buf);
+}
+
+// 🔥 COMMIT
+void commit_txn(int property_id) {
+    char buf[100];
+    sprintf(buf, "COMMIT %d\n", property_id);
+    write_log(buf);
+}
+
+// 🔥 Validate property
+int validate_property(int property_id) {
+
+    int fd = open("data/properties.dat", O_RDONLY);
+
+    if(fd < 0) {
+        printf("❌ No properties found!\n");
+        return 0;
+    }
+
+    Property p;
+
+    while(read(fd, &p, sizeof(Property)) > 0) {
+
+        if(p.property_id == property_id) {
+
+            if(p.is_sold) {
+                printf("❌ Property already sold!\n");
+                close(fd);
+                return 0;
+            }
+
+            if(!p.is_active) {
+                printf("❌ Property not active!\n");
+                close(fd);
+                return 0;
+            }
+
+            close(fd);
+            return 1;
+        }
+    }
+
+    close(fd);
+
+    printf("❌ Property does not exist!\n");
+    return 0;
+}
+
+// 🔥 Get base price
 int get_base_price(int property_id) {
     int fd = open("data/properties.dat", O_RDONLY);
 
-    if(fd < 0) return 0;
+    if(fd < 0) return -1;
 
     Property p;
 
@@ -24,16 +87,15 @@ int get_base_price(int property_id) {
     }
 
     close(fd);
-    return 0;
+    return -1;  // 🔥 important
 }
 
-// Get highest bid
+// 🔥 Get max bid
 int get_max_bid(int property_id, int *winner) {
     int fd = open("data/bids.dat", O_RDONLY | O_CREAT, 0666);
 
     Bid b;
-    int max = 0;
-    int win = -1;
+    int max = 0, win = -1;
 
     while(read(fd, &b, sizeof(Bid)) > 0) {
         if(!b.is_deleted && b.property_id == property_id) {
@@ -50,8 +112,10 @@ int get_max_bid(int property_id, int *winner) {
     return max;
 }
 
-// Mark property sold
-void mark_property_sold(int property_id, int winner, int price) {
+// 🔥 Atomic property update
+void mark_property_sold_atomic(int property_id, int winner, int price) {
+
+    begin_txn(property_id);
 
     int fd = open("data/properties.dat", O_RDWR);
 
@@ -76,21 +140,32 @@ void mark_property_sold(int property_id, int winner, int price) {
     }
 
     close(fd);
+
+    commit_txn(property_id);
 }
 
-// 🔥 Live auction with base price validation
+// 🔥 MAIN AUCTION FUNCTION
 void auction_session(int property_id, int user_id) {
+
+    // 🔥 VALIDATION
+    if(!validate_property(property_id)) {
+        return;
+    }
+
+    int base_price = get_base_price(property_id);
+
+    if(base_price == -1) {
+        printf("❌ Invalid property!\n");
+        return;
+    }
 
     int fd = open("data/bids.dat", O_RDWR | O_CREAT | O_APPEND, 0666);
 
     printf("\n🔥 Live Auction Started\n");
+    printf("💰 Base Price: %d\n", base_price);
 
     time_t last_bid_time = time(NULL);
     int last_seen = -1;
-
-    int base_price = get_base_price(property_id);
-
-    printf("💰 Base Price: %d\n", base_price);
 
     while(1) {
 
@@ -104,11 +179,12 @@ void auction_session(int property_id, int user_id) {
 
         time_t now = time(NULL);
 
+        // ⏱️ Timeout
         if(difftime(now, last_bid_time) >= 60) {
             printf("\n⏱️ Auction ended!\n");
             printf("🏆 Winner: User %d with bid %d\n", winner, current_max);
 
-            mark_property_sold(property_id, winner, current_max);
+            mark_property_sold_atomic(property_id, winner, current_max);
             break;
         }
 
@@ -134,18 +210,16 @@ void auction_session(int property_id, int user_id) {
 
             lock_file(fd);
 
-            // 🔥 NEW LOGIC
+            // 🔥 BASE PRICE + BID VALIDATION
             if(current_max == 0) {
-                // First bid
                 if(amount < base_price) {
-                    printf("❌ Bid must be at least base price (%d)\n", base_price);
+                    printf("❌ Must be ≥ base price (%d)\n", base_price);
                     unlock_file(fd);
                     continue;
                 }
             } else {
-                // Normal bidding
                 if(amount <= current_max) {
-                    printf("❌ Must be higher than %d\n", current_max);
+                    printf("❌ Must be > %d\n", current_max);
                     unlock_file(fd);
                     continue;
                 }
